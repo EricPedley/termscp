@@ -130,18 +130,9 @@ impl FileTransferActivity {
                 {
                     return;
                 }
-                if let Err(err) = self.filetransfer_recv(
-                    TransferPayload::Any(entry),
-                    wrkdir.as_path(),
-                    opts.save_as,
-                ) {
-                    {
-                        self.log_and_alert(
-                            LogLevel::Error,
-                            format!("Could not download file: {err}"),
-                        );
-                    }
-                }
+                self.spawn_download_job(entry, wrkdir, opts.save_as);
+                self.remote_mut().clear_queue();
+                self.reload_remote_filelist();
             }
             SelectedFile::Many(entries) => {
                 // In case of selection: save multiple files in wrkdir/input
@@ -156,23 +147,11 @@ impl FileTransferActivity {
                     return;
                 };
 
-                if let Err(err) = self.filetransfer_recv(
-                    TransferPayload::TransferQueue(entries),
-                    dest_path.as_path(),
-                    None,
-                ) {
-                    {
-                        self.log_and_alert(
-                            LogLevel::Error,
-                            format!("Could not download file: {err}"),
-                        );
-                    }
-                } else {
-                    // clear selection
-                    self.remote_mut().clear_queue();
-                    // reload remote
-                    self.reload_remote_filelist();
+                for (entry, root) in entries {
+                    self.spawn_download_job(entry, root, None);
                 }
+                self.remote_mut().clear_queue();
+                self.reload_remote_filelist();
             }
             SelectedFile::None => {}
         }

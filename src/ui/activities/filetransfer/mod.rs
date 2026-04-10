@@ -5,6 +5,7 @@
 // This module is split into files, cause it's just too big
 mod actions;
 mod components;
+mod downloads;
 mod fswatcher;
 mod lib;
 mod misc;
@@ -253,6 +254,8 @@ pub struct FileTransferActivity {
     cache: Option<TempDir>,
     /// Fs watcher
     fswatcher: Option<FsWatcher>,
+    /// Active background downloads
+    download_jobs: Vec<downloads::DownloadJob>,
     /// host bridge connected
     host_bridge_connected: bool,
     /// remote connected once
@@ -297,6 +300,7 @@ impl FileTransferActivity {
             } else {
                 None
             },
+            download_jobs: Vec::new(),
             host_bridge_connected,
             remote_connected: false,
         })
@@ -493,6 +497,7 @@ impl Activity for FileTransferActivity {
         self.tick();
         // poll
         self.poll_watcher();
+        self.poll_download_jobs();
         // View
         if self.redraw {
             self.view();

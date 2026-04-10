@@ -1,4 +1,6 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::{self, JoinHandle};
 
 use remotefs::fs::{File, Metadata, RemoteFs};
@@ -9,10 +11,44 @@ use crate::filetransfer::{
     FileTransferParams, HostBridgeBuilder, HostBridgeParams, RemoteFsBuilder,
 };
 use crate::host::HostBridge;
+use crate::utils::fmt::fmt_path_elide_ex;
 
 pub(super) struct DownloadJob {
-    label: String,
+    pub(super) label: String,
+    pub(super) progress: Arc<DownloadProgress>,
     handle: JoinHandle<DownloadJobResult>,
+}
+
+pub(super) struct DownloadProgress {
+    pub(super) display_name: String,
+    total_bytes: u64,
+    written_bytes: AtomicU64,
+}
+
+impl DownloadProgress {
+    fn new(display_name: String, total_bytes: u64) -> Self {
+        Self {
+            display_name,
+            total_bytes,
+            written_bytes: AtomicU64::new(0),
+        }
+    }
+
+    fn add_progress(&self, delta: u64) {
+        self.written_bytes.fetch_add(delta, Ordering::Relaxed);
+    }
+
+    pub(super) fn render_line(&self, width: usize) -> String {
+        let progress = self.written_bytes.load(Ordering::Relaxed);
+        let percent = if self.total_bytes == 0 {
+            0
+        } else {
+            ((progress.saturating_mul(100)) / self.total_bytes).min(100)
+        };
+        let suffix = format!(" {:>3}%", percent);
+        let name = fmt_path_elide_ex(Path::new(&self.display_name), width, suffix.len() + 3);
+        format!("{}{}", name, suffix)
+    }
 }
 
 struct DownloadJobResult {
@@ -33,13 +69,29 @@ impl FileTransferActivity {
             Some(name) => format!("{} -> {}", entry.path().display(), name),
             None => entry.path().display().to_string(),
         };
+        let display_name = dst_name.clone().unwrap_or_else(|| entry.name());
+        let total_bytes = if entry.is_dir() {
+            self.get_total_transfer_size_remote(&entry) as u64
+        } else {
+            entry.metadata().size
+        };
+        let progress = Arc::new(DownloadProgress::new(display_name, total_bytes));
         let worker_label = label.clone();
+        let worker_progress = Arc::clone(&progress);
         self.log(LogLevel::Info, format!("Started download in background: {label}"));
         self.download_jobs.push(DownloadJob {
             label,
+            progress,
             handle: thread::spawn(move || DownloadJobResult {
                 label: worker_label,
-                result: download_entry_job(host_bridge_params, remote_params, entry, host_bridge_path, dst_name),
+                result: download_entry_job(
+                    host_bridge_params,
+                    remote_params,
+                    entry,
+                    host_bridge_path,
+                    dst_name,
+                    worker_progress,
+                ),
             }),
         });
     }
@@ -47,6 +99,7 @@ impl FileTransferActivity {
     pub(super) fn poll_download_jobs(&mut self) {
         let mut i = 0;
         let mut should_reload = false;
+        let has_active_jobs = !self.download_jobs.is_empty();
         while i < self.download_jobs.len() {
             if !self.download_jobs[i].handle.is_finished() {
                 i += 1;
@@ -75,6 +128,11 @@ impl FileTransferActivity {
 
         if should_reload {
             self.reload_host_bridge_dir();
+            self.reload_host_bridge_filelist();
+            self.redraw = true;
+        } else if has_active_jobs {
+            self.reload_host_bridge_filelist();
+            self.redraw = true;
         }
     }
 }
@@ -85,6 +143,7 @@ fn download_entry_job(
     entry: File,
     host_bridge_path: PathBuf,
     dst_name: Option<String>,
+    progress: Arc<DownloadProgress>,
 ) -> Result<(), String> {
     let config_client = FileTransferActivity::init_config_client();
     let mut host_bridge = HostBridgeBuilder::build(host_bridge_params, &config_client)?;
@@ -103,6 +162,7 @@ fn download_entry_job(
         &entry,
         host_bridge_path.as_path(),
         dst_name,
+        progress,
     );
 
     let _ = client.disconnect();
@@ -117,6 +177,7 @@ fn download_entry(
     entry: &File,
     host_bridge_path: &Path,
     dst_name: Option<String>,
+    progress: Arc<DownloadProgress>,
 ) -> Result<(), String> {
     if entry.is_dir() {
         let mut host_bridge_dir_path = PathBuf::from(host_bridge_path);
@@ -135,6 +196,7 @@ fn download_entry(
                 &child,
                 host_bridge_dir_path.as_path(),
                 None,
+                Arc::clone(&progress),
             )?;
         }
         return Ok(());
@@ -142,7 +204,13 @@ fn download_entry(
 
     let mut host_bridge_file_path = PathBuf::from(host_bridge_path);
     host_bridge_file_path.push(dst_name.unwrap_or_else(|| entry.name()));
-    download_file(client, host_bridge, host_bridge_file_path.as_path(), entry)
+    download_file(
+        client,
+        host_bridge,
+        host_bridge_file_path.as_path(),
+        entry,
+        progress,
+    )
 }
 
 fn download_file(
@@ -150,31 +218,41 @@ fn download_file(
     host_bridge: &mut dyn HostBridge,
     host_bridge_path: &Path,
     remote: &File,
+    progress: Arc<DownloadProgress>,
 ) -> Result<(), String> {
-    let temp = NamedTempFile::new().map_err(|e| e.to_string())?;
-    let temp_path = temp.path().to_path_buf();
-
     match client.open(remote.path()) {
         Ok(mut reader) => {
-            let mut writer = std::fs::File::create(temp_path.as_path()).map_err(|e| e.to_string())?;
-            std::io::copy(&mut reader, &mut writer).map_err(|e| e.to_string())?;
+            let writer = host_bridge
+                .create_file(host_bridge_path, &remote.metadata)
+                .map_err(|e| e.to_string())?;
+            let mut writer = CountingWriter::new(writer, Arc::clone(&progress));
+            copy_stream(&mut reader, &mut writer)?;
             client.on_read(reader).map_err(|e| e.to_string())?;
+            host_bridge
+                .finalize_write(writer.into_inner())
+                .map_err(|e| e.to_string())?;
         }
         Err(err) if err.kind == remotefs::RemoteErrorType::UnsupportedFeature => {
-            let writer = std::fs::File::create(temp_path.as_path()).map_err(|e| e.to_string())?;
+            let tmp = NamedTempFile::new().map_err(|e| e.to_string())?;
+            let temp_path = tmp.path().to_path_buf();
+            let temp_file = std::fs::File::create(temp_path.as_path()).map_err(|e| e.to_string())?;
+            let writer = CountingWriter::new(temp_file, Arc::clone(&progress));
             client
                 .open_file(remote.path(), Box::new(writer))
+                .map_err(|e| e.to_string())?;
+            let mut temp_reader =
+                std::fs::File::open(temp_path.as_path()).map_err(|e| e.to_string())?;
+            let mut writer = host_bridge
+                .create_file(host_bridge_path, &remote.metadata)
+                .map_err(|e| e.to_string())?;
+            copy_stream(&mut temp_reader, &mut writer)?;
+            host_bridge
+                .finalize_write(writer)
                 .map_err(|e| e.to_string())?;
         }
         Err(err) => return Err(err.to_string()),
     }
 
-    let mut temp_reader = std::fs::File::open(temp_path.as_path()).map_err(|e| e.to_string())?;
-    let mut writer = host_bridge
-        .create_file(host_bridge_path, &remote.metadata)
-        .map_err(|e| e.to_string())?;
-    std::io::copy(&mut temp_reader, &mut writer).map_err(|e| e.to_string())?;
-    host_bridge.finalize_write(writer).map_err(|e| e.to_string())?;
     apply_host_bridge_stat(host_bridge, host_bridge_path, remote.metadata())?;
 
     Ok(())
@@ -186,4 +264,53 @@ fn apply_host_bridge_stat(
     metadata: &Metadata,
 ) -> Result<(), String> {
     host_bridge.setstat(path, metadata).map_err(|e| e.to_string())
+}
+
+fn copy_stream(
+    reader: &mut dyn std::io::Read,
+    writer: &mut dyn std::io::Write,
+) -> Result<(), String> {
+    let mut buf = [0u8; 65535];
+    loop {
+        let bytes_read = reader.read(&mut buf).map_err(|e| e.to_string())?;
+        if bytes_read == 0 {
+            return Ok(());
+        }
+        writer
+            .write_all(&buf[..bytes_read])
+            .map_err(|e| e.to_string())?;
+    }
+}
+
+struct CountingWriter<W> {
+    inner: W,
+    progress: Arc<DownloadProgress>,
+}
+
+impl<W> CountingWriter<W> {
+    fn new(inner: W, progress: Arc<DownloadProgress>) -> Self {
+        Self { inner, progress }
+    }
+
+    fn into_inner(self) -> W {
+        self.inner
+    }
+}
+
+impl<W: std::io::Write> std::io::Write for CountingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let written = self.inner.write(buf)?;
+        self.progress.add_progress(written as u64);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+
+    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        self.inner.write_all(buf)?;
+        self.progress.add_progress(buf.len() as u64);
+        Ok(())
+    }
 }

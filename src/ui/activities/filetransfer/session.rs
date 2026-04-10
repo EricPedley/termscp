@@ -1291,7 +1291,7 @@ impl FileTransferActivity {
     }
 
     /// Get total size of transfer for remote host
-    fn get_total_transfer_size_remote(&mut self, entry: &File) -> usize {
+    pub(super) fn get_total_transfer_size_remote(&mut self, entry: &File) -> usize {
         // mount message to tell we are calculating size
         self.mount_blocking_wait("Calculating transfer size…");
 

@@ -156,11 +156,4 @@ where
     fn open_file(&mut self, src: &Path, dest: Box<dyn Write + Send>) -> RemoteResult<u64> {
         self.inner.open_file(src, dest)
     }
-
-    #[cfg(feature = "find")]
-    fn find(&mut self, search: &str) -> RemoteResult<Vec<File>> {
-        self.inner
-            .find(search)
-            .map(|entries| entries.into_iter().map(Self::fix_file).collect())
-    }
 }

@@ -276,6 +276,13 @@ impl FileTransferActivity {
 
                 vec![span]
             })
+            .chain(self.download_jobs.iter().map(|job| {
+                vec![
+                    TextSpan::new(job.progress.render_line(width))
+                        .fg(Color::LightBlue)
+                        .italic(),
+                ]
+            }))
             .collect();
         // Update content and title
         assert!(
